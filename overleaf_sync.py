@@ -758,19 +758,12 @@ class OverleafSync:
             raise RuntimeError("no documents found in project")
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        pending_local: list[tuple[str, str, str, str]] = []
-        with self._lock:
-            previous_content = {
-                doc_id: state["content"] for doc_id, state in self._docs.items()
-            }
 
         for doc_id, pathname in sorted(docs.items(), key=lambda x: x[1]):
             lines, version = ws.join_doc(doc_id)
             server_content = "\n".join(lines)
             out_path = self.output_dir / pathname
-            local_content = None
-            if out_path.exists():
-                local_content = out_path.read_text(encoding="utf-8")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock:
                 self._docs[doc_id] = {
                     "content": server_content,
@@ -778,27 +771,23 @@ class OverleafSync:
                     "path": pathname,
                     "pending_versions": set(),
                 }
-                prior = previous_content.get(doc_id)
-            if (
-                not initial
-                and prior is not None
-                and local_content is not None
-                and local_content != prior
-            ):
-                pending_local.append((doc_id, pathname, server_content, local_content))
-                continue
-            out_path.parent.mkdir(parents=True, exist_ok=True)
+            if not initial and out_path.exists():
+                local_content = out_path.read_text(encoding="utf-8")
+                if local_content != server_content:
+                    # Local file has edits accumulated during the outage.
+                    # Leave the file as-is; the poll loop will push the diff
+                    # to Overleaf once _ws_ready is set below.  Never push
+                    # here: a failed push inside _connect_and_sync_state
+                    # clears _ws_ready, which the main loop treats as another
+                    # disconnect, causing an infinite reconnect storm.
+                    print(f"  {_ts()} [sync] local edit pending on {pathname} — will push when stable", flush=True)
+                    continue
             out_path.write_text(server_content, encoding="utf-8")
             if initial:
                 print(f"  {pathname:<45} v{version}  ({len(server_content)} chars)")
 
         self._ws = ws
         self._ws_ready.set()
-
-        for doc_id, pathname, server_content, local_content in pending_local:
-            print(f"  [sync] replaying local edits after reconnect: {pathname}", flush=True)
-            if not self._push_change(doc_id, server_content, local_content):
-                print(f"  [sync] deferred local replay for {pathname}", flush=True)
 
     # -- startup --------------------------------------------------------------
 
