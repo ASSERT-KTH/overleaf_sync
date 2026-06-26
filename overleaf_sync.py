@@ -84,6 +84,7 @@ Environment (one of):
 
 import argparse
 import configparser
+import datetime
 import difflib
 import os
 import shutil
@@ -97,8 +98,6 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
-
-import anthropic
 
 
 # ---------------------------------------------------------------------------
@@ -433,332 +432,26 @@ def collect_docs_from_project(project_data: dict) -> dict[str, str]:
     return docs
 
 
-def pick_doc_interactively(docs: dict[str, str]) -> tuple[str, str]:
-    """
-    Show a numbered list of documents and ask the user to pick one.
-    docs: {doc_id: pathname}. Returns (doc_id, pathname).
-    """
-    if not docs:
-        print("Error: no documents found in project.")
-        sys.exit(1)
-
-    entries = sorted(docs.items(), key=lambda x: x[1])
-    print()
-    for i, (doc_id, pathname) in enumerate(entries, 1):
-        print(f"  [{i}] {pathname:<40} (doc: {doc_id})")
-    print()
-
-    while True:
-        try:
-            choice = int(input(f"Select document [1-{len(entries)}]: ").strip())
-            if 1 <= choice <= len(entries):
-                return entries[choice - 1]
-        except (ValueError, EOFError):
-            pass
-        print(f"  Enter a number between 1 and {len(entries)}.")
-
-
 # ---------------------------------------------------------------------------
-# Model API
+# Logging helpers
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """\
-You are an expert LaTeX and academic writing assistant helping edit an Overleaf paper.
-You have access to the full document content.
-
-When asked to make changes:
-- Use the edit_file tool to return the complete modified file content.
-- Preserve all existing LaTeX commands, formatting conventions, and structure
-  unless the instruction explicitly asks to change them.
-- Be precise about LaTeX syntax.
-"""
+import time as _time
 
 
-def make_anthropic_client(api_key: str | None = None) -> tuple[anthropic.Anthropic, str | None]:
-    """
-    Build an Anthropic client.  Returns (client, base_url).
-    base_url is non-None only for the ANTHROPIC_BASE_URL path so that
-    dns_override_if_needed knows which host to watch.
-
-    Priority:
-      1. --api-key / explicit api_key argument
-      2. ANTHROPIC_API_KEY env var
-          3. ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN  (e.g. local agent proxy)
-    """
-    key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-    if key:
-        return anthropic.Anthropic(api_key=key), None
-
-    base_url = os.environ.get("ANTHROPIC_BASE_URL")
-    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
-    if base_url and auth_token:
-        return anthropic.Anthropic(base_url=base_url, auth_token=auth_token), base_url
-
-    print("Error: no Anthropic credentials found.\n"
-          "Set one of:\n"
-          "  export ANTHROPIC_API_KEY=sk-ant-...\n"
-          "  export ANTHROPIC_BASE_URL=... ANTHROPIC_AUTH_TOKEN=...\n"
-          "Or pass: --api-key sk-ant-...")
-    sys.exit(1)
+def _ts() -> str:
+    return datetime.datetime.now().strftime("%H:%M:%S")
 
 
-def ask_model_to_edit(path: str, content: str, instruction: str,
-                      model: str = "claude-sonnet-4-6",
-                      api_key: str | None = None) -> str | None:
-    """Ask the configured model to edit content. Returns new content or None."""
-    client, base_url = make_anthropic_client(api_key)
-
-    tools = [{
-        "name": "edit_file",
-        "description": "Return the complete modified file content",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "string",
-                            "description": "Complete new file content after edits"},
-                "reason":  {"type": "string",
-                            "description": "One-sentence summary of what was changed"},
-            },
-            "required": ["content", "reason"],
-        },
-    }]
-
-    messages = [{
-        "role": "user",
-        "content": (
-            f"=== {path} ===\n{content}\n\n"
-            f"---\n\nInstruction: {instruction}\n\n"
-            "Apply the instruction and call edit_file with the complete new content."
-        ),
-    }]
-
-    # Need enough output tokens to return the full (possibly expanded) document.
-    # 8192 is insufficient for documents >~25k chars. Streaming is required by
-    # the SDK for max_tokens values that could exceed 10 minutes.
-    max_tokens = 32768
-
-    with dns_override_if_needed(base_url or "https://api.anthropic.com"):
-        chars = 0
-        last_dot = 0
-        print("  Streaming", end="", flush=True)
-
-        with client.messages.stream(
-            model=model, max_tokens=max_tokens,
-            system=SYSTEM_PROMPT, tools=tools, messages=messages,
-        ) as stream:
-            for event in stream:
-                if event.type == "content_block_delta":
-                    delta = getattr(event, "delta", None)
-                    if delta and hasattr(delta, "partial_json"):
-                        chars += len(delta.partial_json)
-                        if chars - last_dot >= 500:
-                            print(".", end="", flush=True)
-                            last_dot = chars
-            print(f" ({chars} chars)")
-            response = stream.get_final_message()
-
-        if response.stop_reason == "max_tokens":
-            print(f"  Error: response hit the {max_tokens}-token limit. "
-                  "The document may be too large for a single edit.")
-            return None
-
-        tool_calls = [b for b in response.content if b.type == "tool_use"]
-        for tc in tool_calls:
-            if tc.name == "edit_file":
-                reason = tc.input.get("reason", "")
-                new_content = tc.input.get("content")
-                if reason:
-                    print(f"  Assistant: {reason}")
-                if new_content is None:
-                    print("  Error: model did not return file content.")
-                    return None
-                return new_content
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# REPL
-# ---------------------------------------------------------------------------
-
-class OverleafREPL:
-    """
-    Persistent editing session against a single Overleaf document.
-
-    The WebSocket connection stays open in a background thread.
-    otUpdateApplied events from other collaborators are applied to the
-    local content copy so each model call always sees the current text.
-    """
-
-    def __init__(self, project_id: str, session_cookie: str,
-                 model: str, api_key: str | None):
-        self.project_id = project_id
-        self.session_cookie = session_cookie
-        self.model = model
-        self.api_key = api_key
-
-        self._lock = threading.Lock()
-        self._content = ""
-        self._version = 0
-        self._pending_versions: set[int] = set()  # ops we sent, skip echo
-
-        self.doc_id: str = ""
-        self.doc_path: str = ""
-        self._ws: TrackingSocketIOClient | None = None
-
-    # -- thread-safe content/version accessors --------------------------------
-
-    def _get_state(self) -> tuple[str, int]:
-        with self._lock:
-            return self._content, self._version
-
-    def _set_state(self, content: str, version: int):
-        with self._lock:
-            self._content = content
-            self._version = version
-
-    # -- WebSocket event handler (background thread) --------------------------
-
-    def _on_ot_update(self, args: list):
-        """
-        Receive otUpdateApplied from the server.
-        If it's from another user, apply their ops to our local content.
-        """
-        payload = args[0] if args else {}
-        if payload.get("doc") != self.doc_id:
-            return
-
-        v = payload.get("v")
-        ops = payload.get("op", [])
-
-        with self._lock:
-            if v in self._pending_versions:
-                # This is the echo of our own op — already counted via ack.
-                self._pending_versions.discard(v)
-                return
-            if ops:
-                self._content = apply_sharejs_ops(self._content, ops)
-            # v is the version the op was applied at; new version is v+1
-            if v is not None:
-                self._version = v + 1
-
-    # -- REPL startup ---------------------------------------------------------
-
-    def run(self, doc_id_hint: str | None = None):
-        sys.path.insert(0, str(Path(__file__).parent))
-        from overleaf_cli import OverleafSession
-
-        s = OverleafSession(self.session_cookie)
-        s.get_project_bootstrap(self.project_id)
-
-        # Connect WebSocket — joinProject returns the full doc tree
-        self._ws = TrackingSocketIOClient(s, self.project_id)
-        self._ws.on("otUpdateApplied", self._on_ot_update)
-        self._ws.connect()
-        self._ws.run_forever()
-        project_data = self._ws.join_project()
-        docs = collect_docs_from_project(project_data)
-
-        # Resolve document
-        if doc_id_hint:
-            self.doc_id = doc_id_hint
-            self.doc_path = docs.get(doc_id_hint, doc_id_hint)
-        else:
-            self.doc_id, self.doc_path = pick_doc_interactively(docs)
-
-        # Join doc — authoritative content + version from server
-        lines, version = self._ws.join_doc(self.doc_id)
-        self._set_state("\n".join(lines), version)
-
-        content, version = self._get_state()
-        print(f"\nEditing: {self.doc_path}  (v{version}, {len(content)} chars)")
-        print("Type an instruction, or 'exit' / Ctrl-D to quit.\n")
-
-        try:
-            while True:
-                try:
-                    instruction = input(">>> ").strip()
-                except EOFError:
-                    print()
-                    break
-                if not instruction:
-                    continue
-                if instruction.lower() in ("exit", "quit"):
-                    break
-                self._handle(instruction)
-        finally:
-            self._ws.leave_doc(self.doc_id)
-            self._ws.disconnect()
-            print("Session ended.")
-
-    # -- single instruction ---------------------------------------------------
-
-    def _handle(self, instruction: str):
-        current, _ = self._get_state()
-
-        print("Asking model...")
-        new_content = ask_model_to_edit(
-            self.doc_path, current, instruction,
-            model=self.model, api_key=self.api_key,
-        )
-        if new_content is None or new_content == current:
-            print("No changes.")
-            return
-
-        ops = compute_ot_ops(current, new_content)
-        if not ops:
-            print("No changes.")
-            return
-
-        print(f"Applying {len(ops)} OT operation(s)...")
-        if self._apply_ops(ops, new_content):
-            _, v = self._get_state()
-            print(f"Done. (v{v})")
-
-    def _apply_ops(self, ops: list[dict], expected_new_content: str) -> bool:
-        for i, op in enumerate(ops):
-            kind = "insert" if "i" in op else "delete"
-            text = op.get("i") or op.get("d", "")
-            print(f"  [{i+1}/{len(ops)}] {kind} at {op['p']}: {repr(text[:50])}")
-
-            _, v = self._get_state()
-
-            with self._lock:
-                self._pending_versions.add(v)
-
-            update = {
-                "doc": self.doc_id,
-                "op": [op],
-                "v": v,
-                "dupIfSource": [],
-            }
-            done = threading.Event()
-            ok = [False]
-
-            def on_ack(data, _ok=ok, _done=done):
-                _ok[0] = data and data[0] is None
-                _done.set()
-
-            self._ws.send_event("applyOtUpdate", [self.doc_id, update], callback=on_ack)
-            done.wait(timeout=10)
-
-            if ok[0]:
-                with self._lock:
-                    self._version += 1
-                    self._pending_versions.discard(v)
-            else:
-                with self._lock:
-                    self._pending_versions.discard(v)
-                print(f"  Op {i+1} failed (version conflict). Re-syncing...")
-                lines, new_v = self._ws.join_doc(self.doc_id)
-                self._set_state("\n".join(lines), new_v)
-                print(f"  Re-synced to v{new_v}. Re-run your instruction.")
-                return False
-
-        # All ops succeeded — update local content to the expected new state
-        with self._lock:
-            self._content = expected_new_content
-        return True
+def _ops_summary(ops: list[dict]) -> str:
+    inserted = sum(len(op["i"]) for op in ops if "i" in op)
+    deleted  = sum(len(op["d"]) for op in ops if "d" in op)
+    parts = []
+    if inserted:
+        parts.append(f"+{inserted}ch")
+    if deleted:
+        parts.append(f"-{deleted}ch")
+    return ", ".join(parts) if parts else "no-op"
 
 
 # ---------------------------------------------------------------------------
@@ -799,9 +492,9 @@ class OverleafListener:
             out_path = self.output_dir / state["path"]
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(state["content"], encoding="utf-8")
-            label = (state["path"], state["version"])
+            label = (state["path"], state["version"], _ops_summary(ops))
 
-        print(f"  [{label[0]}] v{label[1]} updated")
+        print(f"  {_ts()} overleaf→local  {label[0]}  v{label[1]}  ({label[2]})")
 
     def run(self):
         sys.path.insert(0, str(Path(__file__).parent))
@@ -852,8 +545,6 @@ class OverleafListener:
 # Bidirectional sync mode
 # ---------------------------------------------------------------------------
 
-import time as _time
-
 
 class OverleafSync:
     """
@@ -881,7 +572,6 @@ class OverleafSync:
         self._running = False
         self._ws_ready = threading.Event()
         self._watch_thread = None
-        self._inotify_proc = None
 
     # -- incoming from Overleaf -----------------------------------------------
 
@@ -915,72 +605,19 @@ class OverleafSync:
             out_path = self.output_dir / state["path"]
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(state["content"], encoding="utf-8")
-            label = (state["path"], state["version"])
+            label = (state["path"], state["version"], _ops_summary(ops))
 
-        print(f"  [overleaf→local] {label[0]}  v{label[1]}")
+        print(f"  {_ts()} overleaf→local  {label[0]}  v{label[1]}  ({label[2]})")
 
     # -- outgoing to Overleaf -------------------------------------------------
 
     def _watch_files(self):
-        """
-        Background thread: watch the output directory with inotifywait.
-        Fires on close_write (in-place save) and moved_to (vi/emacs atomic
-        write-then-rename).  Pushes changes to Overleaf immediately.
-        """
-        # Build a map from absolute path → doc_id for fast lookup.
-        path_to_doc: dict[str, str] = {
-            str((self.output_dir / state["path"]).resolve()): doc_id
-            for doc_id, state in self._docs.items()
-        }
-
-        watch_root = str(self.output_dir.resolve())
-        print(f"  [inotify] watching: {watch_root}", flush=True)
-        for p in path_to_doc:
-            print(f"  [inotify]   tracking: {p}", flush=True)
-
-        cmd = [
-            "inotifywait", "-m", "-r",
-            "-e", "close_write", "-e", "moved_to",
-            "--format", "%w%f",
-            watch_root,
-        ]
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, bufsize=1,
-            )
-        except FileNotFoundError:
-            print("  [sync] inotifywait not found, falling back to polling", flush=True)
-            self._poll_files_fallback()
-            return
-
-        self._inotify_proc = proc
-        for line in proc.stdout:
-            if not self._running:
-                break
-            filepath = line.strip()
-            print(f"  [inotify] event: {filepath!r}", flush=True)
-            doc_id = path_to_doc.get(filepath)
-            if doc_id is None:
-                print(f"  [inotify] (not a tracked file, skipping)", flush=True)
-                continue
-            try:
-                file_content = Path(filepath).read_text(encoding="utf-8")
-            except FileNotFoundError:
-                print(f"  [inotify] file gone (mid-write?), skipping", flush=True)
-                continue
-            with self._lock:
-                state = self._docs.get(doc_id)
-                if state is None or file_content == state["content"]:
-                    print(f"  [inotify] no content change", flush=True)
-                    continue
-                old_content = state["content"]
-            self._push_change(doc_id, old_content, file_content)
-
-        proc.stdout.close()
-
-    def _poll_files_fallback(self):
-        """Polling fallback when inotifywait is unavailable."""
+        # We deliberately use path-based polling rather than inotify here.
+        # inotify watches inodes: tools like Claude Code (and many editors)
+        # delete the file and create a new one on every save, so an inode-level
+        # watch silently breaks after the first write.  Polling reads each
+        # tracked file by its path on every tick, which is always correct
+        # regardless of how the file was written.
         while self._running:
             try:
                 changed: list[tuple[str, str, str]] = []
@@ -996,8 +633,8 @@ class OverleafSync:
                 for doc_id, old, new in changed:
                     self._push_change(doc_id, old, new)
             except Exception as e:
-                print(f"  [sync] poll error: {e}", flush=True)
-            _time.sleep(0.5)
+                print(f"  {_ts()} [sync] poll error: {e}", flush=True)
+            _time.sleep(self.POLL_INTERVAL)
 
     def _push_change(self, doc_id: str, old_content: str, new_content: str):
         ops = compute_ot_ops(old_content, new_content)
@@ -1019,7 +656,7 @@ class OverleafSync:
             print(f"  [sync] websocket disconnected, deferring push for {pathname}", flush=True)
             return False
 
-        print(f"  [local→overleaf] {pathname}  ({len(ops)} op(s))", flush=True)
+        print(f"  {_ts()} local→overleaf  {pathname}  ({_ops_summary(ops)})", flush=True)
 
         for op in ops:
             with self._lock:
@@ -1185,8 +822,6 @@ class OverleafSync:
             print("\nStopping...")
         finally:
             self._running = False
-            if self._inotify_proc:
-                self._inotify_proc.terminate()
             self._disconnect_ws()
             print("Done.")
 
@@ -1231,16 +866,8 @@ def main():
                         help="Path to a specific Firefox cookies.sqlite database")
     parser.add_argument("--listen", action="store_true",
                         help="Passive mode: Overleaf → local folder, read-only")
-    parser.add_argument("--sync", action="store_true",
-                        help="Bidirectional mode: Overleaf ↔ local folder")
     parser.add_argument("--output-dir", default=None,
-                        help="Local folder for --listen/--sync (default: current working directory)")
-    parser.add_argument("--doc-id", default=None,
-                        help="Document ID for REPL mode (omit to pick interactively)")
-    parser.add_argument("--model", default="claude-sonnet-4-6",
-                        help="Model name (default: claude-sonnet-4-6)")
-    parser.add_argument("--api-key", default=None,
-                        help="Anthropic API key (default: $ANTHROPIC_API_KEY)")
+                        help="Local folder (default: current working directory)")
 
     args = parser.parse_args()
 
@@ -1265,8 +892,7 @@ def main():
         print(f"[auto] project_id={args.project_id} (from git remote {remote_url})", flush=True)
 
     if args.output_dir is None:
-        import os as _os
-        args.output_dir = _os.getcwd()
+        args.output_dir = os.path.join(os.getcwd(), args.project_id)
 
     session_cookie = load_overleaf_cookie(
         explicit_cookie=args.cookie,
@@ -1274,25 +900,18 @@ def main():
         cookie_db=args.cookie_db,
     )
 
-    if args.sync:
-        OverleafSync(
-            project_id=args.project_id,
-            session_cookie=session_cookie,
-            output_dir=args.output_dir,
-        ).run()
-    elif args.listen:
+    if args.listen:
         OverleafListener(
             project_id=args.project_id,
             session_cookie=session_cookie,
             output_dir=args.output_dir,
         ).run()
     else:
-        OverleafREPL(
+        OverleafSync(
             project_id=args.project_id,
             session_cookie=session_cookie,
-            model=args.model,
-            api_key=args.api_key,
-        ).run(doc_id_hint=args.doc_id)
+            output_dir=args.output_dir,
+        ).run()
 
 
 if __name__ == "__main__":
