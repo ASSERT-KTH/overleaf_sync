@@ -627,6 +627,14 @@ class OverleafSync:
         # tracked file by its path on every tick, which is always correct
         # regardless of how the file was written.
         while self._running:
+            # While the WebSocket is down, skip pushing entirely.  The
+            # reconnect path in _connect_and_sync_state already detects any
+            # local edits accumulated during the outage and replays them once
+            # the connection is restored — no need to spam the log or block
+            # here waiting for the socket to come back.
+            if not self._ws_ready.is_set():
+                _time.sleep(self.POLL_INTERVAL)
+                continue
             try:
                 changed: list[tuple[str, str, str]] = []
                 with self._lock:
@@ -652,16 +660,12 @@ class OverleafSync:
         with self._lock:
             # Bail if a remote update already changed the baseline.
             if self._docs[doc_id]["content"] != old_content:
-                print(f"  [sync] skipping push (remote update arrived first)", flush=True)
                 return False
             pathname = self._docs[doc_id]["path"]
             ws = self._ws
 
-        if not self._ws_ready.wait(timeout=10):
-            print(f"  [sync] websocket unavailable, deferring push for {pathname}", flush=True)
-            return False
-        if ws is None or not ws.is_connected():
-            print(f"  [sync] websocket disconnected, deferring push for {pathname}", flush=True)
+        if not self._ws_ready.is_set() or ws is None or not ws.is_connected():
+            self._ws_ready.clear()
             return False
 
         print(f"  {_ts()} local→overleaf  {pathname}  ({_ops_summary(ops)})", flush=True)
@@ -701,7 +705,7 @@ class OverleafSync:
 
             if not ok[0]:
                 if not ws.is_connected():
-                    print(f"  [sync] websocket dropped during push for {pathname}", flush=True)
+                    print(f"  {_ts()} [sync] connection lost mid-push for {pathname}, will retry on reconnect", flush=True)
                     self._ws_ready.clear()
                     return False
                 # Version conflict — pull fresh state from server.
@@ -816,15 +820,15 @@ class OverleafSync:
                 ws = self._ws
                 if ws is not None and ws.is_connected():
                     continue
-                print("  [sync] websocket disconnected, reconnecting...", flush=True)
+                print(f"  {_ts()} [sync] disconnected, reconnecting...", flush=True)
                 self._disconnect_ws()
                 while self._running:
                     try:
                         self._connect_and_sync_state(initial=False)
-                        print("  [sync] reconnect complete", flush=True)
+                        print(f"  {_ts()} [sync] reconnected", flush=True)
                         break
                     except Exception as e:
-                        print(f"  [sync] reconnect failed: {e}", flush=True)
+                        print(f"  {_ts()} [sync] reconnect failed: {e} — retrying in 2s", flush=True)
                         _time.sleep(2)
         except KeyboardInterrupt:
             print("\nStopping...")
