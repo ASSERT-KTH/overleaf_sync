@@ -297,11 +297,19 @@ def compute_ot_ops(old: str, new: str) -> list[dict]:
     old_mid = old[prefix:old_suffix_idx]
     new_mid = new[prefix:new_suffix_idx]
     if old_mid or new_mid:
+        # Ops are sent to Overleaf one at a time; each op sees the document
+        # state left by the previous one.  For a replace (delete + insert at
+        # the same position) the delete MUST execute before the insert: if the
+        # insert runs first, the cursor lands on the newly-inserted text and
+        # the subsequent delete corrupts it instead of removing the old text.
+        # We build the list with insert before delete so that reversing it
+        # yields [delete, insert] — highest position first, delete before
+        # insert within the same position.
         ops = []
-        if old_mid:
-            ops.append({"p": prefix, "d": old_mid})
         if new_mid:
             ops.append({"p": prefix, "i": new_mid})
+        if old_mid:
+            ops.append({"p": prefix, "d": old_mid})
         return list(reversed(ops))
 
     ops = []
@@ -314,8 +322,8 @@ def compute_ot_ops(old: str, new: str) -> list[dict]:
         elif tag == "delete":
             ops.append({"p": i1, "d": old[i1:i2]})
         elif tag == "replace":
-            ops.append({"p": i1, "d": old[i1:i2]})
             ops.append({"p": i1, "i": new[j1:j2]})
+            ops.append({"p": i1, "d": old[i1:i2]})
     return list(reversed(ops))
 
 
