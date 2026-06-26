@@ -579,7 +579,11 @@ class OverleafSync:
         self._ws: TrackingSocketIOClient | None = None
         self._running = False
         self._ws_ready = threading.Event()
+        self._ws_ready_at: float = 0.0   # monotonic time when last _ws_ready.set()
         self._watch_thread = None
+        # Docs currently mid-push: poll loop skips them, _on_ot_update skips
+        # disk write so the local edit is preserved until the push finishes.
+        self._push_in_progress: set[str] = set()
 
     # -- incoming from Overleaf -----------------------------------------------
 
@@ -608,14 +612,21 @@ class OverleafSync:
                 state["content"] = apply_sharejs_ops(state["content"], ops)
             if v is not None:
                 state["version"] = v + 1
-            # Write to disk while holding the lock so the poll loop always
-            # sees memory and file in a consistent state.
-            out_path = self.output_dir / state["path"]
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(state["content"], encoding="utf-8")
             label = (state["path"], state["version"], _ops_summary(ops))
+            if doc_id in self._push_in_progress:
+                # A local push is in flight for this doc.  Update the in-memory
+                # state so version tracking stays correct, but do NOT write to
+                # disk — that would overwrite the user's local edit before the
+                # push has a chance to commit state["content"] = new_content.
+                # The push's final state["content"] assignment is authoritative.
+                label = None
+            else:
+                out_path = self.output_dir / state["path"]
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(state["content"], encoding="utf-8")
 
-        print(f"  {_ts()} overleaf→local  {label[0]}  v{label[1]}  ({label[2]})")
+        if label:
+            print(f"  {_ts()} overleaf→local  {label[0]}  v{label[1]}  ({label[2]})")
 
     # -- outgoing to Overleaf -------------------------------------------------
 
@@ -635,10 +646,21 @@ class OverleafSync:
             if not self._ws_ready.is_set():
                 _time.sleep(self.POLL_INTERVAL)
                 continue
+            # Give the connection a few seconds to settle after (re)connect
+            # before sending ops.  Pushing immediately can cause the server to
+            # drop the socket if it hasn't finished its own setup, which
+            # triggers another reconnect and creates an infinite loop.
+            SETTLE_SECS = 3.0
+            age = _time.monotonic() - self._ws_ready_at
+            if age < SETTLE_SECS:
+                _time.sleep(SETTLE_SECS - age)
+                continue
             try:
                 changed: list[tuple[str, str, str]] = []
                 with self._lock:
                     for doc_id, state in list(self._docs.items()):
+                        if doc_id in self._push_in_progress:
+                            continue  # push already running for this doc
                         out_path = self.output_dir / state["path"]
                         try:
                             fc = out_path.read_text(encoding="utf-8")
@@ -663,7 +685,16 @@ class OverleafSync:
                 return False
             pathname = self._docs[doc_id]["path"]
             ws = self._ws
+            self._push_in_progress.add(doc_id)
 
+        try:
+            return self._do_push(doc_id, pathname, ws, ops, new_content)
+        finally:
+            with self._lock:
+                self._push_in_progress.discard(doc_id)
+
+    def _do_push(self, doc_id: str, pathname: str, ws, ops: list[dict], new_content: str) -> bool:
+        """Send ops to Overleaf. Called only while doc_id is in _push_in_progress."""
         if not self._ws_ready.is_set() or ws is None or not ws.is_connected():
             self._ws_ready.clear()
             return False
@@ -787,6 +818,7 @@ class OverleafSync:
                 print(f"  {pathname:<45} v{version}  ({len(server_content)} chars)")
 
         self._ws = ws
+        self._ws_ready_at = _time.monotonic()
         self._ws_ready.set()
 
     # -- startup --------------------------------------------------------------
@@ -804,12 +836,16 @@ class OverleafSync:
         self._watch_thread.start()
 
         try:
+            backoff = 2.0
             while self._running:
                 _time.sleep(1)
                 ws = self._ws
                 if ws is not None and ws.is_connected():
+                    backoff = 2.0  # reset on stable connection
                     continue
-                print(f"  {_ts()} [sync] disconnected, reconnecting...", flush=True)
+                print(f"  {_ts()} [sync] disconnected, reconnecting in {backoff:.0f}s...", flush=True)
+                _time.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
                 self._disconnect_ws()
                 while self._running:
                     try:
