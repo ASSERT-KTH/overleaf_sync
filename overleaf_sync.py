@@ -391,6 +391,8 @@ class TrackingSocketIOClient:
         def on_event(args):
             # event path: args[0] = {"publicId": ..., "project": {rootFolder, ...}}
             if args and isinstance(args[0], dict):
+                if "publicId" in args[0]:
+                    result["_public_id"] = args[0]["publicId"]
                 result.update(args[0].get("project", args[0]))
             done.set()
 
@@ -574,7 +576,7 @@ class OverleafSync:
         self.output_dir = Path(output_dir)
 
         self._lock = threading.Lock()
-        # doc_id → {content, version, path, pending_versions}
+        # doc_id → {content, version, path}
         self._docs: dict[str, dict] = {}
         self._ws: TrackingSocketIOClient | None = None
         self._running = False
@@ -584,6 +586,9 @@ class OverleafSync:
         # Docs currently mid-push: poll loop skips them, _on_ot_update skips
         # disk write so the local edit is preserved until the push finishes.
         self._push_in_progress: set[str] = set()
+        # Our socket.io publicId — used to distinguish our own op echoes from
+        # genuine external ops that happen to share the same version number.
+        self._public_id: str = ""
 
     # -- incoming from Overleaf -----------------------------------------------
 
@@ -592,20 +597,28 @@ class OverleafSync:
         doc_id = payload.get("doc")
         v = payload.get("v")
         ops = payload.get("op", [])
+        source = payload.get("meta", {}).get("source", "")
 
         with self._lock:
             if doc_id not in self._docs:
                 return
             state = self._docs[doc_id]
 
-            # Two-layer echo suppression:
-            # Layer 1 — echo arrives before ack: v is still in pending_versions.
-            if v in state["pending_versions"]:
-                state["pending_versions"].discard(v)
-                return
-            # Layer 2 — echo arrives after ack: version was already incremented
-            # to v+1 in _push_change, so v < state["version"] means stale.
-            if v is not None and v < state["version"]:
+            # Echo suppression: the server broadcasts our own ops back to us
+            # (because we send dupIfSource:[]).  Detect them by the source field
+            # in meta, which the server always sets to our publicId.
+            #
+            # The old version-number-based approach (pending_versions / v <
+            # state["version"]) incorrectly suppressed *concurrent external ops*
+            # that arrived with the same version number as our in-flight op.
+            # That caused local state to diverge → wrong positions in the next
+            # push → otUpdateError in the browser → out-of-sync modal.
+            if self._public_id and source == self._public_id:
+                # This is our own echo.  The ack handler already incremented
+                # state["version"]; just ensure we're not behind if the echo
+                # arrived before the ack for some reason.
+                if v is not None and v + 1 > state["version"]:
+                    state["version"] = v + 1
                 return
 
             if ops:
@@ -705,7 +718,6 @@ class OverleafSync:
             with self._lock:
                 state = self._docs[doc_id]
                 v = state["version"]
-                state["pending_versions"].add(v)
 
             update = {"doc": doc_id, "op": [op], "v": v, "dupIfSource": []}
             done = threading.Event()
@@ -718,8 +730,6 @@ class OverleafSync:
             try:
                 ws.send_event("applyOtUpdate", [doc_id, update], callback=on_ack)
             except Exception as e:
-                with self._lock:
-                    self._docs[doc_id]["pending_versions"].discard(v)
                 print(f"  [sync] send failed for {pathname}: {e}", flush=True)
                 self._ws_ready.clear()
                 return False
@@ -727,10 +737,6 @@ class OverleafSync:
             done.wait(timeout=10)
 
             with self._lock:
-                # Discard pending and increment version atomically so that
-                # the otUpdateApplied echo (which may arrive after the ack)
-                # cannot slip through the pending_versions guard.
-                self._docs[doc_id]["pending_versions"].discard(v)
                 if ok[0]:
                     self._docs[doc_id]["version"] += 1
 
@@ -784,6 +790,7 @@ class OverleafSync:
         ws.connect()
         ws.run_forever()
         project_data = ws.join_project()
+        self._public_id = project_data.pop("_public_id", None) or ""
         docs = collect_docs_from_project(project_data)
         if not docs:
             raise RuntimeError("no documents found in project")
@@ -800,7 +807,6 @@ class OverleafSync:
                     "content": server_content,
                     "version": version,
                     "path": pathname,
-                    "pending_versions": set(),
                 }
             if not initial and out_path.exists():
                 local_content = out_path.read_text(encoding="utf-8")
