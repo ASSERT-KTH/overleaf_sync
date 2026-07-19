@@ -803,6 +803,11 @@ class OverleafSync:
             out_path = self.output_dir / pathname
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock:
+                # Save the pre-disconnect content BEFORE overwriting it with
+                # server_content — we need it to detect stale local files.
+                old_state = self._docs.get(doc_id, {})
+                old_content = old_state.get("content", None)
+
                 self._docs[doc_id] = {
                     "content": server_content,
                     "version": version,
@@ -811,13 +816,26 @@ class OverleafSync:
             if not initial and out_path.exists():
                 local_content = out_path.read_text(encoding="utf-8")
                 if local_content != server_content:
-                    # Local file has edits accumulated during the outage.
-                    # Leave the file as-is; the poll loop will push the diff
-                    # to Overleaf once _ws_ready is set below.  Never push
-                    # here: a failed push inside _connect_and_sync_state
-                    # clears _ws_ready, which the main loop treats as another
-                    # disconnect, causing an infinite reconnect storm.
-                    print(f"  {_ts()} [sync] local edit pending on {pathname} — will push when stable", flush=True)
+                    if old_content is not None and local_content == old_content:
+                        # Local file is stale — identical to the last synced state
+                        # before the disconnect.  Overwrite with the latest server
+                        # content; do NOT push old content to Overleaf.
+                        out_path.write_text(server_content, encoding="utf-8")
+                        print(f"  {_ts()} [sync] stale local {pathname} → updated to v{version}", flush=True)
+                    else:
+                        # Local has genuine edits relative to the pre-disconnect
+                        # state (or old_content is unknown).  Merge them on top
+                        # of the server content so no edits are lost.
+                        print(f"  {_ts()} [sync] local edit pending on {pathname} — merging...", flush=True)
+                        local_ops = compute_ot_ops(old_content or "", local_content)
+                        if local_ops:
+                            merged = apply_sharejs_ops(server_content, local_ops)
+                        else:
+                            merged = local_content
+                        # Keep in-memory state = server_content so the poll loop
+                        # will diff (server → merged) and push to Overleaf.
+                        out_path.write_text(merged, encoding="utf-8")
+                        print(f"  {_ts()} [sync] merged local edits for {pathname}", flush=True)
                     continue
             out_path.write_text(server_content, encoding="utf-8")
             if initial:
