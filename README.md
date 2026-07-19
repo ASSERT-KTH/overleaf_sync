@@ -30,3 +30,31 @@ python3 overleaf_sync.py <project_id>
 ```
 
 Get `overleaf_session2` from your browser cookies while logged in to overleaf.com. Get `project_id` from the URL (`/project/<id>`).
+
+## Reconnect invariants (data-loss prevention)
+
+These invariants are enforced by the test suite in `test_sync_reconnect.py` (103 tests covering every combination of edits during a network outage).
+
+### Scenario A — No edits during disconnection (idle outage)
+Both sides unchanged. **No-op.** Local file stays as-is.
+
+### Scenario B — Only server edits (stale local)
+Local file is **identical to the last-synced state** (the user did not edit locally during the outage).  
+✅ **Invariant:** the local file is **overwritten** with the latest server content. The poll loop does **NOT** push anything to Overleaf.  
+💣 This was the critical data-loss bug: the old code treated a stale file as a pending local edit and pushed old content back to the server, reverting all changes made during the outage.
+
+### Scenario C — Only local edits (genuine pending edits)
+Local file has **new content** relative to the pre-disconnect state; server is unchanged.  
+✅ **Invariant:** local edits are preserved as-is. The poll loop computes OT ops from server content → local content and pushes them to Overleaf.
+
+### Scenario D — Both sides edited different, non-overlapping regions
+Both local and server have new content in distinct parts of the document.  
+✅ **Invariant:** a 3-way merge is performed: local changes are computed as OT ops against the old state, then applied on top of the server state. Both sides' changes survive. The poll loop then pushes the merged result to Overleaf.
+
+### Scenario E — Both sides edited overlapping regions
+Both local and server modified the same span of text.  
+✅ **Invariant:** OT merge is applied deterministically. No crash, no corrupted output, no data loss. Insertions from both sides survive where OT semantics allow.
+
+### Poll-loop correctness (always)
+For every reconnect, the in-memory state is set to the server content. The poll loop then diffs (in-memory state → local file) and pushes the result.  
+✅ **Invariant:** `apply_sharejs_ops(new_memory, ops_to_push) == new_local` — the poll loop always faithfully reproduces the merged local content.
