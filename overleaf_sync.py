@@ -87,6 +87,7 @@ import configparser
 import datetime
 import difflib
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -382,6 +383,18 @@ def ops_to_wire(old_content: str, ops: list[dict]) -> list[dict]:
     the server, the text before its position is still old_content[:p].
     """
     return [{**op, "p": _cp_to_utf16(old_content, op["p"])} for op in ops]
+
+
+_NON_BMP = re.compile("[\U00010000-\U0010FFFF]")
+
+
+def sanitize_non_bmp(content: str) -> str:
+    """
+    Replace each non-BMP char with two U+FFFD, which is what Overleaf stores
+    for it (verified live: emoji sent as JSON escapes or raw UTF-8 both come
+    back as U+FFFD U+FFFD).  Same UTF-16 length, so positions are unaffected.
+    """
+    return _NON_BMP.sub("��", content)
 
 
 def apply_wire_ops(content: str, ops: list[dict]) -> str:
@@ -722,23 +735,43 @@ class OverleafSync:
                 _time.sleep(SETTLE_SECS - age)
                 continue
             try:
-                changed: list[tuple[str, str, str]] = []
-                with self._lock:
-                    for doc_id, state in list(self._docs.items()):
-                        if doc_id in self._push_in_progress:
-                            continue  # push already running for this doc
-                        out_path = self.output_dir / state["path"]
-                        try:
-                            fc = out_path.read_text(encoding="utf-8")
-                        except FileNotFoundError:
-                            continue
-                        if fc != state["content"]:
-                            changed.append((doc_id, state["content"], fc))
-                for doc_id, old, new in changed:
+                for doc_id, old, new in self._collect_local_changes():
                     self._push_change(doc_id, old, new)
             except Exception as e:
                 print(f"  {_ts()} [sync] poll error: {e}", flush=True)
             _time.sleep(self.POLL_INTERVAL)
+
+    def _collect_local_changes(self) -> list[tuple[str, str, str]]:
+        """
+        Return (doc_id, last_synced, local) for every file that differs from
+        the last-known Overleaf state.  Non-BMP chars are rewritten on disk
+        to what Overleaf will store (see sanitize_non_bmp) so the local file
+        keeps matching Overleaf.
+        """
+        changed: list[tuple[str, str, str]] = []
+        with self._lock:
+            for doc_id, state in list(self._docs.items()):
+                if doc_id in self._push_in_progress:
+                    continue  # push already running for this doc
+                out_path = self.output_dir / state["path"]
+                try:
+                    fc = out_path.read_text(encoding="utf-8")
+                except FileNotFoundError:
+                    continue
+                if fc == state["content"]:
+                    continue
+                sanitized = sanitize_non_bmp(fc)
+                if sanitized != fc:
+                    out_path.write_text(sanitized, encoding="utf-8")
+                    print(
+                        f"  {_ts()} [sync] {state['path']}: Overleaf cannot store chars outside "
+                        f"the BMP (e.g. emoji); replaced them with U+FFFD U+FFFD locally",
+                        flush=True,
+                    )
+                    fc = sanitized
+                if fc != state["content"]:
+                    changed.append((doc_id, state["content"], fc))
+        return changed
 
     def _push_change(self, doc_id: str, old_content: str, new_content: str):
         ops = ops_to_wire(old_content, compute_ot_ops(old_content, new_content))

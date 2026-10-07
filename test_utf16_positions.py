@@ -87,3 +87,49 @@ def test_random_roundtrip(seed):
     wire = ops_to_wire(old, compute_ot_ops(old, new_s))
     assert js_server_apply(old, wire) == new_s
     assert apply_wire_ops(old, wire) == new_s
+
+
+# ── non-BMP sanitization (Overleaf stores each non-BMP char as U+FFFD U+FFFD) ──
+
+from overleaf_sync import OverleafSync, sanitize_non_bmp  # noqa: E402
+
+
+def overleaf_server_store(content: str) -> str:
+    """What the live server stores (verified 2026-10-07)."""
+    return "".join("��" if ord(c) > 0xFFFF else c for c in content)
+
+
+@pytest.mark.parametrize("text", ["plain", "a🎉b", "𝔸’é💥", "", "��"])
+def test_sanitize_matches_server(text):
+    assert sanitize_non_bmp(text) == overleaf_server_store(text)
+
+
+def _sync_with_file(tmp_path, synced: str, local: str) -> tuple[OverleafSync, object]:
+    sync = OverleafSync("pid", "cookie", str(tmp_path))
+    (tmp_path / "main.tex").write_text(local, encoding="utf-8")
+    sync._docs["d1"] = {"content": synced, "version": 1, "path": "main.tex"}
+    return sync, tmp_path / "main.tex"
+
+
+def test_local_emoji_rewritten_and_pushed_as_server_form(tmp_path):
+    sync, f = _sync_with_file(tmp_path, "hello", "hello 🎉 there")
+    changed = sync._collect_local_changes()
+    expected = "hello �� there"
+    assert changed == [("d1", "hello", expected)]
+    assert f.read_text(encoding="utf-8") == expected
+    # Invariant: after the push the server holds exactly the local file.
+    ops = ops_to_wire("hello", compute_ot_ops("hello", expected))
+    assert overleaf_server_store(js_server_apply("hello", ops)) == f.read_text(encoding="utf-8")
+
+
+def test_emoji_only_change_that_matches_synced_is_not_pushed(tmp_path):
+    # Synced state already holds the server form; user re-pastes an emoji over it.
+    sync, f = _sync_with_file(tmp_path, "x��y", "x🎉y")
+    assert sync._collect_local_changes() == []
+    assert f.read_text(encoding="utf-8") == "x��y"
+
+
+def test_bmp_only_file_untouched(tmp_path):
+    sync, f = _sync_with_file(tmp_path, "a", "a’é")
+    assert sync._collect_local_changes() == [("d1", "a", "a’é")]
+    assert f.read_text(encoding="utf-8") == "a’é"
