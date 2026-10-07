@@ -327,6 +327,22 @@ def compute_ot_ops(old: str, new: str) -> list[dict]:
     return list(reversed(ops))
 
 
+def decode_doc_line(line: str) -> str:
+    """
+    Undo the line encoding applied by Overleaf's joinDoc response.
+
+    The real-time server sends each doc line as `unescape(encodeURIComponent(line))`,
+    i.e. its UTF-8 bytes packed one per char (the browser reverses it with
+    `decodeURIComponent(escape(line))`).  Without this, "’" arrives as "â\\x80\\x99".
+    otUpdateApplied ops are NOT encoded this way, only joinDoc lines.
+    """
+    try:
+        return line.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        # Already a proper unicode string (char > U+00FF, or not valid UTF-8 bytes).
+        return line
+
+
 def apply_sharejs_ops(content: str, ops: list[dict]) -> str:
     """
     Apply a list of ShareJS ops received from the server to a local string.
@@ -411,7 +427,10 @@ class TrackingSocketIOClient:
         self._handlers.pop("joinProjectResponse", None)
         return result
 
-    def join_doc(self, doc_id): return self._base.join_doc(doc_id)
+    def join_doc(self, doc_id):
+        lines, version = self._base.join_doc(doc_id)
+        return [decode_doc_line(line) for line in lines], version
+
     def leave_doc(self, doc_id): return self._base.leave_doc(doc_id)
     def send_event(self, *a, **kw): return self._base.send_event(*a, **kw)
     def disconnect(self): return self._base.disconnect()
