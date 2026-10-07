@@ -357,6 +357,40 @@ def apply_sharejs_ops(content: str, ops: list[dict]) -> str:
     return content
 
 
+# Overleaf (ShareJS in JS) counts positions in UTF-16 code units; Python str
+# indexes code points.  They differ after any char outside the BMP (emoji,
+# some math symbols).  compute_ot_ops / apply_sharejs_ops work in code points;
+# the two helpers below convert at the wire boundary.
+
+def _cp_to_utf16(content: str, p: int) -> int:
+    if content.isascii():
+        return p
+    return len(content[:p].encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _utf16_to_cp(content: str, p16: int) -> int:
+    if content.isascii():
+        return p16
+    units = content.encode("utf-16-le", "surrogatepass")[: 2 * p16]
+    return len(units.decode("utf-16-le", "surrogatepass"))
+
+
+def ops_to_wire(old_content: str, ops: list[dict]) -> list[dict]:
+    """
+    Convert ops from compute_ot_ops(old_content, ...) to UTF-16 positions.
+    Valid because ops are in descending position order: when each op runs on
+    the server, the text before its position is still old_content[:p].
+    """
+    return [{**op, "p": _cp_to_utf16(old_content, op["p"])} for op in ops]
+
+
+def apply_wire_ops(content: str, ops: list[dict]) -> str:
+    """Apply server ops (UTF-16 positions) sequentially to a local string."""
+    for op in ops:
+        content = apply_sharejs_ops(content, [{**op, "p": _utf16_to_cp(content, op["p"])}])
+    return content
+
+
 # ---------------------------------------------------------------------------
 # Socket.io client with event handler support
 # ---------------------------------------------------------------------------
@@ -515,7 +549,7 @@ class OverleafListener:
                 return
             state = self._docs[doc_id]
             if ops:
-                state["content"] = apply_sharejs_ops(state["content"], ops)
+                state["content"] = apply_wire_ops(state["content"], ops)
             if v is not None:
                 state["version"] = v + 1
             out_path = self.output_dir / state["path"]
@@ -641,7 +675,7 @@ class OverleafSync:
                 return
 
             if ops:
-                state["content"] = apply_sharejs_ops(state["content"], ops)
+                state["content"] = apply_wire_ops(state["content"], ops)
             if v is not None:
                 state["version"] = v + 1
             label = (state["path"], state["version"], _ops_summary(ops))
@@ -707,7 +741,7 @@ class OverleafSync:
             _time.sleep(self.POLL_INTERVAL)
 
     def _push_change(self, doc_id: str, old_content: str, new_content: str):
-        ops = compute_ot_ops(old_content, new_content)
+        ops = ops_to_wire(old_content, compute_ot_ops(old_content, new_content))
         if not ops:
             return True
 
