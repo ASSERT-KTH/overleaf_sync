@@ -679,7 +679,10 @@ class OverleafSync:
             # that arrived with the same version number as our in-flight op.
             # That caused local state to diverge → wrong positions in the next
             # push → otUpdateError in the browser → out-of-sync modal.
-            if self._public_id and source == self._public_id:
+            # In practice (verified live) the server strips our own echo down
+            # to {"v", "doc"}: no op, no meta.  Other clients' updates always
+            # carry an op, so a missing op also identifies our echo.
+            if "op" not in payload or (self._public_id and source == self._public_id):
                 # This is our own echo.  The ack handler already incremented
                 # state["version"]; just ensure we're not behind if the echo
                 # arrived before the ack for some reason.
