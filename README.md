@@ -31,6 +31,15 @@ python3 overleaf_sync.py <project_id>
 
 Get `overleaf_session2` from your browser cookies while logged in to overleaf.com. Get `project_id` from the URL (`/project/<id>`).
 
+## Live concurrent editing
+
+While a coauthor types, their ops are merged into the local file, never written over it (`test_concurrent_edits.py`):
+
+- 🧾 State per doc: `content` = server doc + our in-flight op; the file = `content` + edits not pushed yet.
+- 📥 A coauthor's op is transformed (ShareJS text OT, `transform_x`) past our in-flight op and past the unpushed local edits, then applied to the file.
+- 📤 A local change is sent as one `applyOtUpdate`; it is acknowledged by its stripped `{v, doc}` echo, not by the callback (which only means "queued"). One in flight per doc.
+- 🔁 If the push is rejected or never echoed: re-join the doc and 3-way merge the local file onto the server content.
+
 ## Reconnect invariants (data-loss prevention)
 
 These invariants are enforced by the test suite in `test_sync_reconnect.py` (103 tests covering every combination of edits during a network outage).

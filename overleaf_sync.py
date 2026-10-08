@@ -399,9 +399,104 @@ def sanitize_non_bmp(content: str) -> str:
 
 def apply_wire_ops(content: str, ops: list[dict]) -> str:
     """Apply server ops (UTF-16 positions) sequentially to a local string."""
+    return apply_sharejs_ops(content, wire_to_cp(content, ops))
+
+
+def wire_to_cp(content: str, ops: list[dict]) -> list[dict]:
+    """Convert server ops (UTF-16 positions, applied sequentially) to code points."""
+    out = []
     for op in ops:
-        content = apply_sharejs_ops(content, [{**op, "p": _utf16_to_cp(content, op["p"])}])
-    return content
+        cp_op = {**op, "p": _utf16_to_cp(content, op["p"])}
+        out.append(cp_op)
+        content = apply_sharejs_ops(content, [cp_op])
+    return out
+
+
+# OT transform for ShareJS text ops (port of share/lib/types/text.js).  An op
+# is a list of {p,i}/{p,d} components applied sequentially.  Our ops are the
+# "left" side, as on the Overleaf server: concurrent inserts at the same
+# position put ours first.
+
+def _transform_pos(pos: int, c: dict, insert_after: bool = False) -> int:
+    if "i" in c:
+        if c["p"] < pos or (c["p"] == pos and insert_after):
+            return pos + len(c["i"])
+        return pos
+    if pos <= c["p"]:
+        return pos
+    if pos <= c["p"] + len(c["d"]):
+        return c["p"]
+    return pos - len(c["d"])
+
+
+def _transform_component(dest: list[dict], c: dict, other: dict, side: str) -> None:
+    if "i" in c:
+        if c["i"]:
+            dest.append({"p": _transform_pos(c["p"], other, side == "right"), "i": c["i"]})
+        return
+    if "i" in other:
+        s = c["d"]
+        if c["p"] < other["p"]:
+            dest.append({"p": c["p"], "d": s[: other["p"] - c["p"]]})
+            s = s[other["p"] - c["p"]:]
+        if s:
+            dest.append({"p": c["p"] + len(other["i"]), "d": s})
+        return
+    # delete vs delete
+    if c["p"] >= other["p"] + len(other["d"]):
+        dest.append({"p": c["p"] - len(other["d"]), "d": c["d"]})
+    elif c["p"] + len(c["d"]) <= other["p"]:
+        dest.append(c)
+    else:
+        d = ""
+        if c["p"] < other["p"]:
+            d = c["d"][: other["p"] - c["p"]]
+        if c["p"] + len(c["d"]) > other["p"] + len(other["d"]):
+            d += c["d"][other["p"] + len(other["d"]) - c["p"]:]
+        if d:
+            dest.append({"p": _transform_pos(c["p"], other), "d": d})
+
+
+def transform_x(left: list[dict], right: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Given ops `left` and `right` both applicable to the same document, return
+    (left', right') such that apply(apply(doc, left), right') ==
+    apply(apply(doc, right), left').
+    """
+    new_right: list[dict] = []
+    for rc in right:
+        new_left: list[dict] = []
+        k = 0
+        cur: dict | None = rc
+        while k < len(left):
+            next_c: list[dict] = []
+            _transform_component(new_left, left[k], cur, "left")
+            _transform_component(next_c, cur, left[k], "right")
+            k += 1
+            if len(next_c) == 1:
+                cur = next_c[0]
+            elif not next_c:
+                new_left.extend(left[k:])
+                cur = None
+                break
+            else:
+                l2, r2 = transform_x(left[k:], next_c)
+                new_left.extend(l2)
+                new_right.extend(r2)
+                cur = None
+                break
+        if cur is not None:
+            new_right.append(cur)
+        left = new_left
+    return left, new_right
+
+
+def merge3(base: str, mine: str, theirs: str) -> str:
+    """3-way merge: apply both base→mine and base→theirs edits."""
+    mine_ops = compute_ot_ops(base, mine)
+    theirs_ops = compute_ot_ops(base, theirs)
+    _, theirs_t = transform_x(mine_ops, theirs_ops)
+    return apply_sharejs_ops(mine, theirs_t)
 
 
 # ---------------------------------------------------------------------------
@@ -630,8 +725,10 @@ class OverleafSync:
     - Local file changes (detected by polling every 0.5 s) → diffed against
       the last-known Overleaf state → pushed as OT ops via applyOtUpdate.
 
-    Conflict resolution: if an applyOtUpdate is rejected (version mismatch),
-    we re-join the doc from the server and overwrite the local file.
+    Concurrent edits: incoming ops are transformed past our in-flight op and
+    unpushed local edits, then merged into the local file.  If an
+    applyOtUpdate is rejected, we re-join the doc and 3-way merge the local
+    file onto the server content.
     """
 
     POLL_INTERVAL = 0.5  # seconds between local file checks
@@ -649,9 +746,6 @@ class OverleafSync:
         self._ws_ready = threading.Event()
         self._ws_ready_at: float = 0.0   # monotonic time when last _ws_ready.set()
         self._watch_thread = None
-        # Docs currently mid-push: poll loop skips them, _on_ot_update skips
-        # disk write so the local edit is preserved until the push finishes.
-        self._push_in_progress: set[str] = set()
         # Our socket.io publicId — used to distinguish our own op echoes from
         # genuine external ops that happen to share the same version number.
         self._public_id: str = ""
@@ -684,33 +778,52 @@ class OverleafSync:
             # In practice (verified live) the server strips our own echo down
             # to {"v", "doc"}: no op, no meta.  Other clients' updates always
             # carry an op, so a missing op also identifies our echo.
+            #
+            # This echo is also the real ack of our in-flight op (as in
+            # Overleaf's own client): the applyOtUpdate callback only means
+            # "queued", and other clients' ops the server applied before ours
+            # can still arrive after it.
             if "op" not in payload or (self._public_id and source == self._public_id):
-                # This is our own echo.  The ack handler already incremented
-                # state["version"]; just ensure we're not behind if the echo
-                # arrived before the ack for some reason.
+                inflight = state.get("inflight")
+                if inflight and (v is None or v >= state["version"]):
+                    del state["inflight"]
+                    inflight["done"].set()
                 if v is not None and v + 1 > state["version"]:
                     state["version"] = v + 1
                 return
 
-            if ops:
-                state["content"] = apply_wire_ops(state["content"], ops)
+            # state["content"] is the server doc at state["version"] with our
+            # in-flight op (if any) applied; the file on disk is that plus the
+            # user's not-yet-pushed edits.  Remote ops are relative to the
+            # server doc, so transform them past both before applying, rather
+            # than overwriting the file with the server content.
+            inflight = state.get("inflight")
+            base = inflight["base"] if inflight else state["content"]
+            remote = wire_to_cp(base, ops)
+            if inflight:
+                inflight["base"] = apply_sharejs_ops(base, remote)
+                inflight["ops"], remote = transform_x(inflight["ops"], remote)
+            old_content = state["content"]
+            state["content"] = apply_sharejs_ops(old_content, remote)
             if v is not None:
                 state["version"] = v + 1
-            label = (state["path"], state["version"], _ops_summary(ops))
-            if doc_id in self._push_in_progress:
-                # A local push is in flight for this doc.  Update the in-memory
-                # state so version tracking stays correct, but do NOT write to
-                # disk — that would overwrite the user's local edit before the
-                # push has a chance to commit state["content"] = new_content.
-                # The push's final state["content"] assignment is authoritative.
-                label = None
-            else:
-                out_path = self.output_dir / state["path"]
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(state["content"], encoding="utf-8")
 
-        if label:
-            print(f"  {_ts()} overleaf→local  {label[0]}  v{label[1]}  ({label[2]})")
+            out_path = self.output_dir / state["path"]
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                local = out_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                local = old_content
+            if local == old_content:
+                merged, note = state["content"], ""
+            else:
+                local_ops = compute_ot_ops(old_content, local)
+                _, remote_t = transform_x(local_ops, remote)
+                merged, note = apply_sharejs_ops(local, remote_t), ", merged with local edits"
+            out_path.write_text(merged, encoding="utf-8")
+            label = (state["path"], state["version"], _ops_summary(ops) + note)
+
+        print(f"  {_ts()} overleaf→local  {label[0]}  v{label[1]}  ({label[2]})")
 
     # -- outgoing to Overleaf -------------------------------------------------
 
@@ -778,7 +891,7 @@ class OverleafSync:
         changed: list[tuple[str, str, str]] = []
         with self._lock:
             for doc_id, state in list(self._docs.items()):
-                if doc_id in self._push_in_progress:
+                if state.get("inflight"):
                     continue  # push already running for this doc
                 out_path = self.output_dir / state["path"]
                 try:
@@ -800,80 +913,76 @@ class OverleafSync:
                     changed.append((doc_id, state["content"], fc))
         return changed
 
-    def _push_change(self, doc_id: str, old_content: str, new_content: str):
-        ops = ops_to_wire(old_content, compute_ot_ops(old_content, new_content))
-        if not ops:
+    def _push_change(self, doc_id: str, old_content: str, new_content: str) -> bool:
+        """
+        Send old → new as ONE applyOtUpdate and wait for its echo.  Remote ops
+        arriving meanwhile are transformed against it by _on_ot_update.
+        """
+        cp_ops = compute_ot_ops(old_content, new_content)
+        if not cp_ops:
             return True
-
+        done = threading.Event()
+        err: list = [None]
         with self._lock:
+            state = self._docs[doc_id]
             # Bail if a remote update already changed the baseline.
-            if self._docs[doc_id]["content"] != old_content:
+            if state["content"] != old_content or state.get("inflight"):
                 return False
-            pathname = self._docs[doc_id]["path"]
             ws = self._ws
-            self._push_in_progress.add(doc_id)
+            if not self._ws_ready.is_set() or ws is None or not ws.is_connected():
+                self._ws_ready.clear()
+                return False
+            pathname = state["path"]
+            v = state["version"]
+            state["inflight"] = {"ops": cp_ops, "base": old_content, "done": done}
+            state["content"] = new_content
 
+        ops = ops_to_wire(old_content, cp_ops)
+        print(f"  {_ts()} local→overleaf  {pathname}  ({_ops_summary(ops)})", flush=True)
+
+        def on_ack(data):
+            if data and data[0] is not None:
+                err[0] = data[0]
+                done.set()
+
+        update = {"doc": doc_id, "op": ops, "v": v, "dupIfSource": []}
         try:
-            return self._do_push(doc_id, pathname, ws, ops, new_content)
-        finally:
-            with self._lock:
-                self._push_in_progress.discard(doc_id)
-
-    def _do_push(self, doc_id: str, pathname: str, ws, ops: list[dict], new_content: str) -> bool:
-        """Send ops to Overleaf. Called only while doc_id is in _push_in_progress."""
-        if not self._ws_ready.is_set() or ws is None or not ws.is_connected():
+            ws.send_event("applyOtUpdate", [doc_id, update], callback=on_ack)
+        except Exception as e:
+            print(f"  [sync] send failed for {pathname}: {e}", flush=True)
             self._ws_ready.clear()
             return False
 
-        print(f"  {_ts()} local→overleaf  {pathname}  ({_ops_summary(ops)})", flush=True)
+        if done.wait(timeout=10) and err[0] is None:
+            return True
+        if not ws.is_connected():
+            # Reconnect re-joins every doc and merges the local file.
+            print(f"  {_ts()} [sync] connection lost mid-push for {pathname}, will retry on reconnect", flush=True)
+            self._ws_ready.clear()
+            return False
+        print(f"  [sync] push of {pathname} failed ({err[0] or 'no echo'}), re-syncing from Overleaf...", flush=True)
+        self._resync_doc(doc_id, ws)
+        return False
 
-        for op in ops:
-            with self._lock:
-                state = self._docs[doc_id]
-                v = state["version"]
-
-            update = {"doc": doc_id, "op": [op], "v": v, "dupIfSource": []}
-            done = threading.Event()
-            ok = [False]
-
-            def on_ack(data, _ok=ok, _done=done):
-                _ok[0] = data and data[0] is None
-                _done.set()
-
-            try:
-                ws.send_event("applyOtUpdate", [doc_id, update], callback=on_ack)
-            except Exception as e:
-                print(f"  [sync] send failed for {pathname}: {e}", flush=True)
-                self._ws_ready.clear()
-                return False
-
-            done.wait(timeout=10)
-
-            with self._lock:
-                if ok[0]:
-                    self._docs[doc_id]["version"] += 1
-
-            if not ok[0]:
-                if not ws.is_connected():
-                    print(f"  {_ts()} [sync] connection lost mid-push for {pathname}, will retry on reconnect", flush=True)
-                    self._ws_ready.clear()
-                    return False
-                # Version conflict — pull fresh state from server.
-                print(f"  [sync] conflict on {pathname}, re-syncing from Overleaf...", flush=True)
-                lines, new_v = ws.join_doc(doc_id)
-                server_content = "\n".join(lines)
-                with self._lock:
-                    self._docs[doc_id]["content"] = server_content
-                    self._docs[doc_id]["version"] = new_v
-                out_path = self.output_dir / pathname
-                out_path.write_text(server_content, encoding="utf-8")
-                print(f"  [sync] reset to server v{new_v}", flush=True)
-                return False  # discard remaining ops for this edit
-
-        # All ops applied — commit new content as the new baseline.
+    def _resync_doc(self, doc_id: str, ws) -> None:
+        """Re-join doc_id and merge the local file onto the server content."""
+        lines, new_v = ws.join_doc(doc_id)
+        server_content = "\n".join(lines)
         with self._lock:
-            self._docs[doc_id]["content"] = new_content
-        return True
+            state = self._docs[doc_id]
+            inflight = state.pop("inflight", None)
+            # Merge from before the failed op, so it is re-pushed if the
+            # server lacks it.
+            base = inflight["base"] if inflight else state["content"]
+            out_path = self.output_dir / state["path"]
+            try:
+                local = out_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                local = state["content"]
+            state["content"] = server_content
+            state["version"] = new_v
+            out_path.write_text(merge3(base, local, server_content), encoding="utf-8")
+        print(f"  [sync] re-synced to server v{new_v}, local edits kept", flush=True)
 
     def _disconnect_ws(self):
         self._ws_ready.clear()
@@ -920,6 +1029,10 @@ class OverleafSync:
                 # server_content — we need it to detect stale local files.
                 old_state = self._docs.get(doc_id, {})
                 old_content = old_state.get("content", None)
+                # An unacked op may not have reached the server: merge from
+                # before it so it is re-pushed rather than silently dropped.
+                inflight = old_state.get("inflight")
+                merge_base = inflight["base"] if inflight else old_content
 
                 self._docs[doc_id] = {
                     "content": server_content,
@@ -929,7 +1042,7 @@ class OverleafSync:
             if not initial and out_path.exists():
                 local_content = out_path.read_text(encoding="utf-8")
                 if local_content != server_content:
-                    if old_content is not None and local_content == old_content:
+                    if old_content is not None and local_content == old_content and not inflight:
                         # Local file is stale — identical to the last synced state
                         # before the disconnect.  Overwrite with the latest server
                         # content; do NOT push old content to Overleaf.
@@ -940,11 +1053,7 @@ class OverleafSync:
                         # state (or old_content is unknown).  Merge them on top
                         # of the server content so no edits are lost.
                         print(f"  {_ts()} [sync] local edit pending on {pathname} — merging...", flush=True)
-                        local_ops = compute_ot_ops(old_content or "", local_content)
-                        if local_ops:
-                            merged = apply_sharejs_ops(server_content, local_ops)
-                        else:
-                            merged = local_content
+                        merged = merge3(merge_base or "", local_content, server_content)
                         # Keep in-memory state = server_content so the poll loop
                         # will diff (server → merged) and push to Overleaf.
                         out_path.write_text(merged, encoding="utf-8")
