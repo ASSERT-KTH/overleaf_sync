@@ -655,6 +655,8 @@ class OverleafSync:
         # Our socket.io publicId — used to distinguish our own op echoes from
         # genuine external ops that happen to share the same version number.
         self._public_id: str = ""
+        # Set by the watch thread on an unrecoverable condition; run() exits 1.
+        self._fatal: str | None = None
 
     # -- incoming from Overleaf -----------------------------------------------
 
@@ -719,7 +721,23 @@ class OverleafSync:
         # watch silently breaks after the first write.  Polling reads each
         # tracked file by its path on every tick, which is always correct
         # regardless of how the file was written.
+        #
+        # Path-based polling has one blind spot: if output_dir itself is
+        # renamed (e.g. `mv dir dir.bak` then a fresh checkout at `dir`),
+        # editors whose cwd was inside it keep writing to the renamed copy,
+        # which we never read again.  Stop the sync when that happens: going
+        # on would silently drop those edits, or push the new dir's content.
+        dir_ino = self._dir_inode()
         while self._running:
+            if self._dir_inode() != dir_ino:
+                self._fatal = (
+                    f"{self.output_dir} was moved, deleted or replaced while syncing.\n"
+                    f"Edits made in the old directory (e.g. by an editor whose cwd was "
+                    f"inside it) were NOT pushed to Overleaf.\n"
+                    f"Restart the sync, and restart editors/shells that were inside it."
+                )
+                self._running = False
+                return
             # While the WebSocket is down, skip pushing entirely.  The
             # reconnect path in _connect_and_sync_state already detects any
             # local edits accumulated during the outage and replays them once
@@ -743,6 +761,12 @@ class OverleafSync:
             except Exception as e:
                 print(f"  {_ts()} [sync] poll error: {e}", flush=True)
             _time.sleep(self.POLL_INTERVAL)
+
+    def _dir_inode(self) -> int | None:
+        try:
+            return self.output_dir.stat().st_ino
+        except FileNotFoundError:
+            return None
 
     def _collect_local_changes(self) -> list[tuple[str, str, str]]:
         """
@@ -974,6 +998,9 @@ class OverleafSync:
             self._running = False
             self._disconnect_ws()
             print("Done.")
+        if self._fatal:
+            print(f"\nError: {self._fatal}", file=sys.stderr, flush=True)
+            sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
