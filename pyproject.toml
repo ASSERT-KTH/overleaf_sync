@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "overleaf-sync"
+version = "0.3.0"
+description = "Live two-way sync between an Overleaf project and a local folder, for any editor or coding agent"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["requests", "websocket-client"]
+
+[project.scripts]
+overleaf-sync = "overleaf_sync.sync:main"
+overleaf-sync-lsp = "overleaf_sync.lsp:main"
+
+[project.optional-dependencies]
+test = ["pytest"]
+e2e = ["selenium"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+python_files = ["test_*.py"]

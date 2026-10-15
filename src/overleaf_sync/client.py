@@ -16,13 +16,13 @@ STEP 6: Live edit       → joinProject → joinDoc → applyOtUpdate (ShareJS o
 STEP 7: Compile         → POST /project/{id}/compile
 
 Usage:
-  python3 overleaf_cli.py --cookie <overleaf_session2> info <project_id>
-  python3 overleaf_cli.py --cookie <overleaf_session2> read <project_id> <file_path>
-  python3 overleaf_cli.py --cookie <overleaf_session2> history <project_id>
-  python3 overleaf_cli.py --cookie <overleaf_session2> connect <project_id>
-  python3 overleaf_cli.py --cookie <overleaf_session2> edit <project_id> <doc_id> <position> <text>
-  python3 overleaf_cli.py --cookie <overleaf_session2> compile <project_id>
-  python3 overleaf_cli.py analyze-har <har_file>
+  python3 -m overleaf_sync.client --cookie <overleaf_session2> info <project_id>
+  python3 -m overleaf_sync.client --cookie <overleaf_session2> read <project_id> <file_path>
+  python3 -m overleaf_sync.client --cookie <overleaf_session2> history <project_id>
+  python3 -m overleaf_sync.client --cookie <overleaf_session2> connect <project_id>
+  python3 -m overleaf_sync.client --cookie <overleaf_session2> edit <project_id> <doc_id> <position> <text>
+  python3 -m overleaf_sync.client --cookie <overleaf_session2> compile <project_id>
+  python3 -m overleaf_sync.client analyze-har <har_file>
 """
 
 import argparse
@@ -33,6 +33,7 @@ import json
 import re
 import sys
 import time
+import os
 import threading
 import urllib.parse
 from typing import Optional
@@ -40,12 +41,104 @@ from typing import Optional
 import requests
 import websocket  # pip install websocket-client
 
-BASE_URL = "https://www.overleaf.com"
+DEFAULT_URL = "https://www.overleaf.com"
+BASE_URL = DEFAULT_URL
+COOKIE_NAME = "overleaf_session2"
+_HOST = "www.overleaf.com"
+WS_BASE = "wss://www.overleaf.com"
+
+
+def default_cookie_name(url: str) -> str:
+    """overleaf.com names its session cookie overleaf_session2; Community/Server Pro use overleaf.sid."""
+    host = urllib.parse.urlparse(url).hostname or ""
+    return "overleaf_session2" if host == "overleaf.com" or host.endswith(".overleaf.com") else "overleaf.sid"
+
+
+def configure(url: Optional[str] = None, cookie_name: Optional[str] = None) -> None:
+    """
+    Point the client at an Overleaf instance (overleaf.com, Community Edition,
+    Server Pro, an institutional install).  Falls back to OVERLEAF_URL /
+    OVERLEAF_COOKIE_NAME, then to overleaf.com.
+    """
+    global BASE_URL, COOKIE_NAME, _HOST, WS_BASE
+    url = (url or os.environ.get("OVERLEAF_URL") or DEFAULT_URL).rstrip("/")
+    if "://" not in url:
+        url = "https://" + url
+    BASE_URL = url
+    COOKIE_NAME = cookie_name or os.environ.get("OVERLEAF_COOKIE_NAME") or default_cookie_name(url)
+    _HOST = urllib.parse.urlparse(url).hostname or "www.overleaf.com"
+    WS_BASE = ("wss" if url.startswith("https") else "ws") + "://" + url.split("://", 1)[1]
+
+
+def _cookie_domain(host: str) -> str:
+    """requests files cookies for dot-less hosts (localhost, intranet names) under "<host>.local"."""
+    import ipaddress
+    if "." in host or ":" in host:
+        return host
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        return host + ".local"
+
+
+configure()   # environment / default; the CLI calls it again with its own flags
 
 
 # ---------------------------------------------------------------------------
 # STEP 1 & 2: Authentication + Project Bootstrap
 # ---------------------------------------------------------------------------
+
+class RateLimited(RuntimeError):
+    """HTTP 429: the server asked us to slow down; honour Retry-After when it is a number of seconds."""
+
+    def __init__(self, retry_after=None):
+        try:
+            self.retry_after = min(max(float(retry_after), 0.0), 600.0) if retry_after is not None else None
+        except (TypeError, ValueError):
+            self.retry_after = None
+        super().__init__("Overleaf is rate-limiting this client (HTTP 429)"
+                         + (f"; asked to wait {self.retry_after:.0f}s" if self.retry_after else ""))
+
+
+class UnsupportedProtocol(RuntimeError):
+    """The server announces a real-time/OT protocol stage this client was not written or tested for."""
+
+    def __init__(self, stage):
+        self.stage = stage
+        super().__init__(
+            f"this Overleaf announces OT migration stage {stage!r}; only stage 0 (the classic "
+            f"real-time protocol) is supported, and writing with an unknown protocol could corrupt "
+            f"documents. Nothing was changed. If you accept that risk, pass --allow-unknown-protocol.")
+
+
+# Set from the CLI (--allow-unknown-protocol): downgrade UnsupportedProtocol to "go ahead anyway".
+ALLOW_UNKNOWN_PROTOCOL = False
+
+
+class AuthError(RuntimeError):
+    """The session cookie was rejected (expired, logged out, or wrong)."""
+
+
+def login_with_password(email: str, password: str) -> str:
+    """
+    Log in to a Community Edition / Server Pro instance with e-mail and
+    password and return the session cookie value.  overleaf.com cannot be
+    used this way (captcha / SSO): take its cookie from the browser.
+    """
+    s = requests.Session()
+    page = s.get(f"{BASE_URL}/login")
+    page.raise_for_status()
+    m = re.search(r'name="ol-csrfToken"[^>]*content="([^"]*)"', page.text)
+    if not m:
+        raise AuthError("could not find the login form's CSRF token")
+    token = html.unescape(m.group(1))
+    r = s.post(f"{BASE_URL}/login", json={"email": email, "password": password, "_csrf": token},
+               headers={"X-Csrf-Token": token})
+    if r.status_code != 200 or COOKIE_NAME not in s.cookies:
+        raise AuthError(f"login failed (HTTP {r.status_code}); check e-mail/password")
+    return s.cookies[COOKIE_NAME]
+
 
 class OverleafSession:
     """Manages auth and extracts bootstrap data from Overleaf project page."""
@@ -53,7 +146,7 @@ class OverleafSession:
     def __init__(self, session_cookie: str):
         self.session = requests.Session()
         # The only required cookie for auth is overleaf_session2
-        self.session.cookies.set("overleaf_session2", session_cookie, domain="www.overleaf.com")
+        self.session.cookies.set(COOKIE_NAME, session_cookie, domain=_cookie_domain(_HOST))
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (compatible; overleaf-cli/1.0)",
             "Origin": BASE_URL,
@@ -75,6 +168,15 @@ class OverleafSession:
           - ol-otMigrationStage  → 0 = old OT protocol, 1+ = new history protocol
         """
         resp = self.session.get(f"{BASE_URL}/project/{project_id}")
+        if resp.status_code in (401, 403) or "/login" in resp.url:
+            raise AuthError(
+                "Overleaf rejected the session cookie (expired, logged out or wrong). "
+                "Log in again in the browser and pass a fresh cookie."
+            )
+        if resp.status_code == 404:
+            raise RuntimeError(f"project {project_id} not found (or no access)")
+        if resp.status_code == 429:
+            raise RateLimited(resp.headers.get("Retry-After"))
         resp.raise_for_status()
 
         bootstrap = {}
@@ -100,6 +202,9 @@ class OverleafSession:
                 bootstrap[name] = True
 
         self._csrf_token = bootstrap.get("ol-csrfToken")
+        stage = bootstrap.get("ol-otMigrationStage")       # absent on older servers
+        if stage not in (0, None) and not ALLOW_UNKNOWN_PROTOCOL:
+            raise UnsupportedProtocol(stage)
         return bootstrap
 
     @property
@@ -111,6 +216,38 @@ class OverleafSession:
         if self._csrf_token:
             h["X-Csrf-Token"] = self._csrf_token
         return h
+
+    # -- project tree (documents and folders) ---------------------------------
+
+    def _tree_request(self, method: str, project_id: str, path: str, payload: Optional[dict] = None) -> dict:
+        r = self.session.request(method, f"{BASE_URL}/project/{project_id}/{path}",
+                                 json=payload, headers=self._json_headers(), timeout=30)
+        if r.status_code == 429:
+            raise RateLimited(r.headers.get("Retry-After"))
+        if r.status_code in (401, 403):
+            raise AuthError(f"Overleaf refused {method} {path.split('/')[0]} (HTTP {r.status_code}): "
+                            f"expired session, or no edit access to this project")
+        if not r.ok:
+            raise RuntimeError(f"{method} {path} failed: HTTP {r.status_code} {r.text[:200].strip()}")
+        try:
+            return r.json()
+        except ValueError:
+            return {}
+
+    def create_doc(self, project_id: str, name: str, parent_folder_id: str) -> dict:
+        return self._tree_request("POST", project_id, "doc", {"name": name, "parent_folder_id": parent_folder_id})
+
+    def create_folder(self, project_id: str, name: str, parent_folder_id: str) -> dict:
+        return self._tree_request("POST", project_id, "folder", {"name": name, "parent_folder_id": parent_folder_id})
+
+    def rename_doc(self, project_id: str, doc_id: str, name: str) -> dict:
+        return self._tree_request("POST", project_id, f"doc/{doc_id}/rename", {"name": name})
+
+    def move_doc(self, project_id: str, doc_id: str, folder_id: str) -> dict:
+        return self._tree_request("POST", project_id, f"doc/{doc_id}/move", {"folder_id": folder_id})
+
+    def delete_doc(self, project_id: str, doc_id: str) -> dict:
+        return self._tree_request("DELETE", project_id, f"doc/{doc_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +462,7 @@ class SocketIOClient:
             for c in self.session.session.cookies
         )
         ws_url = (
-            f"wss://www.overleaf.com/socket.io/1/websocket/{self._session_id}"
+            f"{WS_BASE}/socket.io/1/websocket/{self._session_id}"
             f"?projectId={self.project_id}&esh=1&ssp=1"
         )
 
@@ -436,18 +573,24 @@ class SocketIOClient:
     def join_doc(self, doc_id: str) -> tuple[list[str], int]:
         """
         Send joinDoc and get document lines + version.
-        Returns (lines, version).
+        Returns (lines, version).  Raises RuntimeError on timeout or error
+        ack: an unanswered join must never look like an empty document.
         """
         lines = []
         version = 0
         done = threading.Event()
+        ok = [False]
+        err: list = [None]
 
         def on_ack(data):
             nonlocal version
             # data = [null, [lines...], version, ranges, ...]
-            if data and len(data) >= 3:
-                lines.extend(data[1] or [])
+            if data and data[0] is None and len(data) >= 3 and data[1] is not None:
+                lines.extend(data[1])
                 version = data[2] or 0
+                ok[0] = True
+            else:
+                err[0] = data[0] if data and data[0] is not None else data
             done.set()
 
         self.send_event(
@@ -455,7 +598,10 @@ class SocketIOClient:
             [doc_id, {"encodeRanges": True}],
             callback=on_ack
         )
-        done.wait(timeout=10)
+        if not done.wait(timeout=10):
+            raise RuntimeError(f"joinDoc {doc_id}: no answer from server")
+        if not ok[0]:
+            raise RuntimeError(f"joinDoc {doc_id} failed: {err[0]}")
         return lines, version
 
     def apply_insert(self, doc_id: str, position: int, text: str, version: int) -> bool:
