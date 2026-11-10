@@ -269,63 +269,115 @@ def load_overleaf_cookie(
 # OT helpers
 # ---------------------------------------------------------------------------
 
-def compute_ot_ops(old: str, new: str) -> list[dict]:
+def _trimmed_replace(old: str, new: str, offset: int) -> list[dict]:
     """
-    Diff old → new and return a list of ShareJS ops in reverse position order
-    so they can be applied sequentially without shifting offsets.
+    Ops (ascending, delete before insert) turning old into new, where both
+    are one changed region located at `offset` in the document.  Common
+    leading/trailing chars are kept, so only the changed span is touched.
     """
-    if old == new:
-        return []
-
-    # Fast path for the common case in editor sync: one contiguous edit inside
-    # a large document. This avoids SequenceMatcher's pathological latency on
-    # near-identical long strings.
     prefix = 0
     max_prefix = min(len(old), len(new))
     while prefix < max_prefix and old[prefix] == new[prefix]:
         prefix += 1
-
-    old_suffix_idx = len(old)
-    new_suffix_idx = len(new)
-    while (
-        old_suffix_idx > prefix
-        and new_suffix_idx > prefix
-        and old[old_suffix_idx - 1] == new[new_suffix_idx - 1]
-    ):
-        old_suffix_idx -= 1
-        new_suffix_idx -= 1
-
-    old_mid = old[prefix:old_suffix_idx]
-    new_mid = new[prefix:new_suffix_idx]
-    if old_mid or new_mid:
-        # Ops are sent to Overleaf one at a time; each op sees the document
-        # state left by the previous one.  For a replace (delete + insert at
-        # the same position) the delete MUST execute before the insert: if the
-        # insert runs first, the cursor lands on the newly-inserted text and
-        # the subsequent delete corrupts it instead of removing the old text.
-        # We build the list with insert before delete so that reversing it
-        # yields [delete, insert] — highest position first, delete before
-        # insert within the same position.
-        ops = []
-        if new_mid:
-            ops.append({"p": prefix, "i": new_mid})
-        if old_mid:
-            ops.append({"p": prefix, "d": old_mid})
-        return list(reversed(ops))
-
+    o_end, n_end = len(old), len(new)
+    while o_end > prefix and n_end > prefix and old[o_end - 1] == new[n_end - 1]:
+        o_end -= 1
+        n_end -= 1
     ops = []
-    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
+    # Delete before insert at the same position: each op sees the document
+    # left by the previous one, so an insert first would make the delete
+    # remove the inserted text instead of the old text.
+    if o_end > prefix:
+        ops.append({"p": offset + prefix, "d": old[prefix:o_end]})
+    if n_end > prefix:
+        ops.append({"p": offset + prefix, "i": new[prefix:n_end]})
+    return ops
+
+
+def compute_ot_ops(old: str, new: str) -> list[dict]:
+    """
+    Diff old → new and return ShareJS ops in descending position order, so
+    they can be applied sequentially without shifting offsets.
+
+    Unchanged lines are never part of an op: edits are found with a
+    line-level diff (fast even on large near-identical texts, unlike a
+    char-level SequenceMatcher), then each changed line block is split into
+    word-level spans (see _word_blocks), each trimmed to its changed chars.
+    Two small edits far apart thus give two small ops,
+    never one replace of everything in between: such a replace would revert
+    a coauthor's concurrent edits in that span and move their insertions
+    to its edge.
+    """
+    if old == new:
+        return []
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    old_off = [0]
+    for line in old_lines:
+        old_off.append(old_off[-1] + len(line))
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    blocks = [
+        block
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+        if tag != "equal"
+        for block in _word_blocks("".join(old_lines[i1:i2]), "".join(new_lines[j1:j2]), old_off[i1])
+    ]
+    # Last block first (positions of earlier blocks stay valid); within a
+    # block keep [delete, insert].
+    return [op for block in reversed(blocks) for op in block]
+
+
+_TOKEN = re.compile(r"\w+|\s+|[^\w\s]")
+_WORD_DIFF_MAX_TOKENS = 20000  # beyond this, token SequenceMatcher gets slow
+_WORD_DIFF_MIN_SIMILARITY = 0.5  # below this, the block is a real rewrite
+
+
+def _word_blocks(old: str, new: str, offset: int) -> list[list[dict]]:
+    """
+    Split one changed line block (e.g. a reflowed or lightly edited
+    paragraph) into word-level replaces, so unchanged words are not
+    deleted and re-inserted.  A block that is mostly new text stays one
+    replace: matching stray "the"/"\\cite" tokens would only scatter it.
+    Returns ascending lists of ops, one per changed span.
+    """
+    old_t, new_t = _TOKEN.findall(old), _TOKEN.findall(new)
+    if not old_t or not new_t or len(old_t) + len(new_t) > _WORD_DIFF_MAX_TOKENS:
+        return [_trimmed_replace(old, new, offset)]
+    matcher = difflib.SequenceMatcher(None, old_t, new_t, autojunk=False)
+    opcodes = matcher.get_opcodes()
+    same = sum(len("".join(old_t[i1:i2])) for tag, i1, i2, _, _ in opcodes if tag == "equal")
+    if 2 * same < _WORD_DIFF_MIN_SIMILARITY * (len(old) + len(new)):
+        return [_trimmed_replace(old, new, offset)]
+    old_off = [0]
+    for tok in old_t:
+        old_off.append(old_off[-1] + len(tok))
+    spans = [
+        _trimmed_replace("".join(old_t[i1:i2]), "".join(new_t[j1:j2]), old_off[i1])
+        for tag, i1, i2, j1, j2 in opcodes
+        if tag != "equal"
+    ]
+    # Slide each pure insert/delete as far right as it goes without changing
+    # the result (e.g. insert " B" before "W" in "A W" → "B " after "A ").
+    # This matches a char-level diff with a maximal common prefix, and keeps
+    # an insert out of a concurrent delete that ends where the insert starts.
+    for k, span in enumerate(spans):
+        if len(span) != 1:
             continue
-        if tag == "insert":
-            ops.append({"p": i1, "i": new[j1:j2]})
-        elif tag == "delete":
-            ops.append({"p": i1, "d": old[i1:i2]})
-        elif tag == "replace":
-            ops.append({"p": i1, "i": new[j1:j2]})
-            ops.append({"p": i1, "d": old[i1:i2]})
-    return list(reversed(ops))
+        op = span[0]
+        limit = spans[k + 1][0]["p"] if k + 1 < len(spans) else len(old)
+        p = op["p"]
+        if "i" in op:
+            text = op["i"]
+            while p < limit and old[p] == text[0]:
+                text = text[1:] + old[p]
+                p += 1
+            span[0] = {"p": p, "i": text}
+        else:
+            n = len(op["d"])
+            while p + n < limit and old[p] == old[p + n]:
+                p += 1
+            span[0] = {"p": p, "d": old[p:p + n]}
+    return [[{**op, "p": op["p"] + offset} for op in span] for span in spans]
 
 
 def decode_doc_line(line: str) -> str:

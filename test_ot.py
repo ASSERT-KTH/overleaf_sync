@@ -189,3 +189,104 @@ def test_git_backup_roundtrip():
     lines = content.split("\n")
     if len(lines) > 1:
         roundtrip(content, "\n".join(lines[1:]))
+
+
+# ── no replace of unchanged text ─────────────────────────────────────────────
+
+def _max_op_len(ops: list[dict]) -> int:
+    return max(len(op.get("i", "")) + len(op.get("d", "")) for op in ops)
+
+
+def test_distant_edits_give_small_ops():
+    """Two 1-char edits at both ends must not delete+reinsert the middle."""
+    old = "A" * 50 + "\n" + "x\n" * 5000 + "B" * 50
+    new = "Z" + old[1:-1] + "Y"
+    ops = compute_ot_ops(old, new)
+    assert server_apply(old, ops) == new
+    assert _max_op_len(ops) <= 2, ops
+
+
+def test_many_scattered_line_edits_stay_local():
+    lines = [f"line {k} with some text\n" for k in range(3000)]
+    new_lines = list(lines)
+    for k in range(0, 3000, 300):
+        new_lines[k] = new_lines[k].replace("some", "other")
+    del new_lines[1500]
+    new_lines.insert(2000, "brand new line\n")
+    old, new = "".join(lines), "".join(new_lines)
+    ops = compute_ot_ops(old, new)
+    assert server_apply(old, ops) == new
+    assert _max_op_len(ops) <= len("line 1500 with some text\n"), ops
+
+
+def test_ops_descending_positions():
+    old = "a\nb\nc\nd\ne\n"
+    new = "A\nb\nC\nd\nE\n"
+    ops = compute_ot_ops(old, new)
+    ps = [op["p"] for op in ops]
+    assert ps == sorted(ps, reverse=True)
+    assert server_apply(old, ops) == new
+
+
+def test_large_near_identical_is_fast():
+    import time
+    old = "".join(f"\\item paragraph {k} lorem ipsum dolor\n" for k in range(20000))
+    new = old.replace("paragraph 7 ", "PARAGRAPH 7 ").replace("paragraph 19999", "p19999")
+    t = time.monotonic()
+    ops = compute_ot_ops(old, new)
+    assert time.monotonic() - t < 2.0
+    assert server_apply(old, ops) == new
+
+
+# ── word-level splitting of changed paragraphs ──────────────────────────────
+
+PARA = ("We present a novel approach to program repair that leverages large "
+        "language models and a feedback loop with the test suite, achieving "
+        "state of the art results on Defects4J and QuixBugs benchmarks.\n")
+
+
+def test_reflowed_paragraph_keeps_words():
+    """Rewrapping lines changes only whitespace: no word is deleted."""
+    old = "intro\n" + PARA + "outro\n"
+    reflowed = PARA.replace(" leverages large ", " leverages large\n").replace(" suite, ", " suite,\n")
+    new = "intro\n" + reflowed + "outro\n"
+    ops = compute_ot_ops(old, new)
+    assert server_apply(old, ops) == new
+    assert all(not op.get("d", "").strip() for op in ops), ops
+
+
+def test_scattered_word_edits_in_one_line():
+    old = "intro\n" + PARA + "outro\n"
+    new = old.replace("novel", "new").replace("Defects4J", "Defects4J v2").replace("loop", "cycle")
+    ops = compute_ot_ops(old, new)
+    assert server_apply(old, ops) == new
+    assert _max_op_len(ops) <= len("loop") + len("cycle"), ops
+
+
+def test_full_rewrite_stays_one_replace():
+    old = "intro\n" + PARA + "outro\n"
+    new = "intro\nCompletely different sentence about the weather in Stockholm.\noutro\n"
+    ops = compute_ot_ops(old, new)
+    assert server_apply(old, ops) == new
+    assert len(ops) == 2, ops
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_random_word_edits_roundtrip(seed):
+    import random
+    rnd = random.Random(seed)
+    words = ["a", "b", "foo", " ", "\n", ",", "\\cite{x}", "é", "  "]
+    old = "".join(rnd.choice(words) for _ in range(rnd.randint(0, 60)))
+    new = list(_TOKEN_SPLIT(old))
+    for _ in range(rnd.randint(1, 5)):
+        k = rnd.randint(0, len(new))
+        if new and rnd.random() < 0.5:
+            del new[min(k, len(new) - 1)]
+        else:
+            new.insert(k, rnd.choice(words))
+    roundtrip(old, "".join(new))
+
+
+def _TOKEN_SPLIT(s):
+    import re
+    return re.findall(r"\w+|\s+|[^\w\s]", s)
