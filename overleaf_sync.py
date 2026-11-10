@@ -1,85 +1,45 @@
 #!/usr/bin/env python3
 """
-overleaf_agent.py — Interactive REPL for live-editing Overleaf papers with an LLM
-==================================================================================
+overleaf_sync.py — Live sync between an Overleaf project and a local folder
+===========================================================================
 
-HOW TO USE IN AN AGENT SESSION
-------------------------------
+Uses Overleaf's real-time protocol (Socket.io over WebSocket), the one the
+browser editor uses, instead of the Git bridge, so local edits (e.g. by an
+agent) and coauthors typing in the browser merge live, with no push
+conflicts.
 
-1. Resolve your session cookie:
-   By default the script reads `overleaf_session2` from Firefox's cookie jar.
-   You can still pass `--cookie` explicitly to override this.
+USAGE
+-----
+  python3 overleaf_sync.py [project_id] [--listen] [--output-dir DIR]
 
-2. Start a REPL session:
+  project_id   from the Overleaf URL; if omitted, read from a
+               `git remote` pointing at git.overleaf.com/<project_id>
+  --output-dir default ./<project_id>
+  --listen     read-only mirror: Overleaf → local folder
 
-   $ python3 overleaf_agent.py <project_id>
+MODES
+-----
+  Sync (default), Overleaf ↔ local:
+    - joins every doc of the project and writes it to the output folder
+    - remote ops (otUpdateApplied) are applied in memory and merged into
+      the local file, keeping not-yet-pushed local edits
+    - local files are polled every 0.5 s by path (survives editors that
+      replace the file on save); a change is diffed against the last
+      synced content by line, then by word, and pushed as one
+      applyOtUpdate, so unchanged text is never deleted and re-inserted
+    - on a rejected op or a reconnect, the doc is re-joined and the local
+      file 3-way merged onto the server content
+    - stops if the output folder is moved or replaced
 
-   If the project has multiple documents you will be shown a numbered list
-   and asked to pick one:
+  Listen (--listen): Overleaf → local only, no pushes.
 
-     [1] main.tex          (doc: 69a81e69bdcdae63f5c4be41, v526)
-     [2] references/refs.bib  ...
-   Select document [1-2]: 1
+AUTH
+----
+  The overleaf_session2 cookie, from the first of:
+    --cookie, $OVERLEAF_COOKIE, Firefox cookies.sqlite (default profile,
+    or --firefox-profile / --cookie-db)
 
-   Then type instructions one after another:
-
-     Editing: main.tex (v526, 18069 chars)
-     >>> add an easter egg in the conclusion
-       Assistant: Added a hidden comment in the conclusion
-     Applying 1 OT operation...
-     Done. (v527)
-     >>> make the abstract shorter
-     ...
-     >>> exit
-
-3. To skip the file picker, pass --doc-id:
-   $ python3 overleaf_agent.py <project_id> \
-       --doc-id 69a81e69bdcdae63f5c4be41
-
-HOW IT WORKS
-------------
-  Session startup:
-    - Connects to Overleaf via Socket.io (WebSocket, kept alive in a thread)
-    - Joins the project and the selected document
-    - Receives the current document content + version number
-
-  On each instruction:
-    - Sends current content + instruction to the model
-    - The model returns the modified content via tool use
-    - Diffs old vs new → minimal insert/delete OT operations
-    - Pushes ops via the live WebSocket (applyOtUpdate)
-    - Changes appear in Overleaf instantly; version increments
-
-  Background WebSocket thread:
-    - Heartbeats keep the connection alive between instructions
-    - otUpdateApplied events from other collaborators are applied to the
-      local content copy so the model always sees the latest version
-
-USING FROM WITHIN AN AGENT SESSION
----------------------------------
-Add to your local agent instructions:
-
-  ## Tools
-  - python3 overleaf_agent.py <project_id> [--cookie $OVERLEAF_COOKIE] [--doc-id <id>]
-    Opens an interactive REPL to live-edit the Overleaf document.
-
-Default auth source:
-  Firefox cookies.sqlite → overleaf_session2
-
-Override sources:
-  --cookie
-  OVERLEAF_COOKIE
-
-For non-interactive use from an agent pass --doc-id so the file picker is
-skipped.
-
-Dependencies:
-  pip install requests websocket-client anthropic
-
-Environment (one of):
-  ANTHROPIC_API_KEY=sk-ant-...
-  ANTHROPIC_BASE_URL=... + ANTHROPIC_AUTH_TOKEN=...   (agent proxy)
-  --api-key flag
+Dependencies: pip install requests websocket-client
 """
 
 import argparse
@@ -1170,28 +1130,18 @@ class OverleafSync:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Live Overleaf ↔ local sync and model editing REPL",
+        description="Live sync between an Overleaf project and a local folder",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             examples:
-              # zero-arg sync from a git repo with an Overleaf remote
-              python3 overleaf_agent.py --sync
+              # bidirectional sync, project id from the Overleaf git remote
+              python3 overleaf_sync.py
 
-              # interactive file picker → REPL
-              python3 overleaf_agent.py 69a0589216d96e98bc76b8c6 \\
-                  --cookie "s:abc123..."
+              # bidirectional sync into ./paper
+              python3 overleaf_sync.py 69a0589216d96e98bc76b8c6 --output-dir paper
 
-              # skip file picker
-              python3 overleaf_agent.py 69a0589216d96e98bc76b8c6 \\
-                  --cookie "s:abc123..." --doc-id 69a81e69bdcdae63f5c4be41
-
-              # passive mirror: Overleaf → local
-              python3 overleaf_agent.py 69a0589216d96e98bc76b8c6 \\
-                  --cookie "s:abc123..." --listen
-
-              # bidirectional sync: Overleaf ↔ local
-              python3 overleaf_agent.py 69a0589216d96e98bc76b8c6 \\
-                  --cookie "s:abc123..." --sync
+              # read-only mirror: Overleaf → local
+              python3 overleaf_sync.py 69a0589216d96e98bc76b8c6 --listen
         """),
     )
     parser.add_argument("project_id", nargs="?", default=None,
@@ -1205,7 +1155,7 @@ def main():
     parser.add_argument("--listen", action="store_true",
                         help="Passive mode: Overleaf → local folder, read-only")
     parser.add_argument("--output-dir", default=None,
-                        help="Local folder (default: current working directory)")
+                        help="Local folder (default: ./<project_id>)")
 
     args = parser.parse_args()
 
